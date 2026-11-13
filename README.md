@@ -152,6 +152,45 @@ rows it already has) and copies the new rows into the local `public.incidencias`
 (`INCIDENCIAS_API_USER` / `INCIDENCIAS_API_PASSWORD`; the token is renewed automatically). Limitation: it detects *new*
 incidents only, not later edits to rows already copied.
 
+## Scheduled retraining and hot reload
+
+The live service keeps the data fresh all the time, but **a model is not retrained per incident**: the daily forecast changes
+once a day and a model needs days of new data to learn anything. Retraining is a separate job that runs a few times a week.
+
+| What | How often | Where |
+|---|---|---|
+| Pull new incidents, clean, update zones and "arrivals" | every 10 s / 2 s | the running API (`live.py`) |
+| Daily forecast | once per day (when the last complete day changes) | the running API |
+| **Retrain temporal + spatial models** | weekly (skips itself if < 7 new days) | `python -m app.retrain` |
+| EDA, comparison, tuning | on demand (e.g. monthly or when changing the model) | `app.eda`, `app.compare`, `app.tune` |
+
+`python -m app.retrain` (flags: `--force`, `--dry-run`, `--min-new-days N`):
+
+1. takes a lock (no two runs at once), pulls the newest incidents from the production API and cleans them;
+2. decides whether to retrain (no model, `--force`, or ≥ 7 new complete days since the last training);
+3. trains **into `models/.staging`** (data refresh → temporal model → spatial model);
+4. runs a **quality gate**: the temporal model must beat the naive baseline on the same windows, and the spatial top-5 % capture
+   must stay ≥ 25 % and within 5 points of the model being replaced;
+5. only if the gate passes, swaps the files (previous ones are kept in `models/previous/`; `metrics.json` is swapped last).
+
+A rejected or failed run never touches the model that is serving: that is the rollback. Each run is appended to
+`models/retrain_history.json` and `logs/retrain.log`. Exit codes: 0 promoted/skipped, 1 rejected, 2 error.
+
+**Hot reload:** the API watches `models/metrics.json`; when the job swaps it, the API loads the new model, spatial parameters and
+catalog, recomputes the forecast and bumps `version` (the front-end refreshes by itself). No restart. `/api/live/status` reports
+`modelo.entrenado`, `modelo.datos_hasta`, `modelo.cargado` and `modelo.error_recarga`.
+
+Scheduling:
+
+```powershell
+.\scripts\schedule_retrain.ps1                      # Windows: weekly, Sundays 03:00 (-Day, -Time, -Remove)
+```
+```cron
+0 3 * * 0  cd /path/to/backend && python -m app.retrain   # Linux/macOS
+```
+PostgreSQL must be reachable when the job runs. Not covered yet: drift monitoring (alerting when live accuracy degrades) and
+a retraining trigger based on it.
+
 ## Cameras
 
 Camera positions are sensitive and are **not in this repository** (see `geo/README.md`). To import the municipal cameras
@@ -190,10 +229,11 @@ app/
   camaras_remote.py  camera importer                     simulate.py  replay a past cut-off in "real time"
   outliers.py      IQR report + winsorization             compare.py   model comparison report
   tune.py          time-aware hyper-parameter search       eda.py       exploratory analysis + insights
+  retrain.py       scheduled retraining job (staging, quality gate, atomic swap)
   api.py           FastAPI service
 tests/             pytest suite on synthetic data (python -m pytest)
 geo/               jurisdiction polygons
-scripts/db_start.ps1
+scripts/            db_start.ps1 (local PostgreSQL), schedule_retrain.ps1 (Windows scheduled task)
 ```
 
 Code comments and docstrings are in Spanish.
@@ -202,6 +242,6 @@ Code comments and docstrings are in Spanish.
 
 1. Shift roster and operations calendar (the only variable that explains the unexplained day-to-day variance).
 2. More history (Nov 2025 – Feb 2026 are missing; Police and Fire units).
-3. Scheduled re-training and drift monitoring (the live service does **not** retrain by itself).
+3. Drift monitoring: scheduled re-training exists (`app.retrain`), but nothing yet alerts when live accuracy degrades.
 4. Operator feedback on each flagged zone (was it verified? did something happen?).
 5. Authentication on the API.
