@@ -105,6 +105,17 @@ from the Sivecam API, set `SIVECAM_API_URL/USER/PASSWORD` and run `python -m app
 `GET /municipal?page=0` from your browser and run `python -m app.camaras_remote --archivo response.json`.
 Neighbourhood cameras are detected and stored separately, keeping only position, brand and mode.
 
+## Contributing / Git workflow
+
+- **Branches:** `main` is always releasable; `develop` integrates finished work; every change lives in a short-lived branch cut
+  from `develop` and named `feature/<topic>`, `fix/<topic>`, `chore/<topic>` or `docs/<topic>`.
+- **Commits:** [Conventional Commits](https://www.conventionalcommits.org/) in English, small and focused
+  (`feat: ...`, `fix: ...`, `refactor: ...`, `test: ...`, `docs: ...`, `chore: ...`).
+- **Pull requests:** feature branch -> `develop` (with the PR template), then `develop` -> `main` for a release.
+  Nothing is pushed directly to `main`.
+- **Tests:** `pip install -r requirements-dev.txt && python -m pytest`. Tests use synthetic data only.
+- **Never commit** `.env`, real incident data, models, reports derived from real data, or camera locations (see `.gitignore`).
+
 ## Privacy and security
 
 - Secrets live only in `.env` (git-ignored). `.env.example` lists every variable.
