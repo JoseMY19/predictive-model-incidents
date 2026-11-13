@@ -4,6 +4,10 @@ from __future__ import annotations
 import numpy as np
 import pandas as pd
 from sklearn.ensemble import ExtraTreesRegressor, HistGradientBoostingRegressor, RandomForestRegressor
+from sklearn.linear_model import Ridge
+from sklearn.neighbors import KNeighborsRegressor
+from sklearn.pipeline import make_pipeline
+from sklearn.preprocessing import RobustScaler
 
 from . import config
 from .features import feature_columns, make_features, training_rows
@@ -21,6 +25,19 @@ def make_model(kind: str):
         # Pérdida Poisson: apropiada para conteos (no negativos, muchos ceros).
         return HistGradientBoostingRegressor(loss="poisson", learning_rate=0.05, max_iter=300,
                                              min_samples_leaf=20, random_state=config.RANDOM_STATE)
+    if kind == "ridge":
+        # Linear baseline. RobustScaler (median/IQR) keeps heavy-tailed count features from dominating the fit.
+        return make_pipeline(RobustScaler(), Ridge(alpha=10.0))
+    if kind == "knn":
+        # Distance-based model: scaling is mandatory, otherwise lag_28 would outweigh the one-hot columns.
+        return make_pipeline(RobustScaler(), KNeighborsRegressor(n_neighbors=25, weights="distance", n_jobs=-1))
+    if kind == "xgboost":
+        try:
+            from xgboost import XGBRegressor
+        except ImportError as e:                                    # optional dependency
+            raise ImportError("xgboost is not installed: pip install xgboost") from e
+        return XGBRegressor(objective="count:poisson", n_estimators=400, learning_rate=0.05, max_depth=5, subsample=0.8,
+                            colsample_bytree=0.8, min_child_weight=10, n_jobs=-1, random_state=config.RANDOM_STATE)
     raise ValueError(kind)
 
 
@@ -29,6 +46,9 @@ MODEL_LABELS = {
     "extra_trees": "Extra Trees",
     "ensemble_rf_es": "Ensamble (Random Forest + suavizado exponencial)",
     "hist_gradient_boosting": "Gradient Boosting (Poisson)",
+    "ridge": "Ridge regression",
+    "knn": "K-Nearest Neighbors",
+    "xgboost": "XGBoost (Poisson)",
     "baseline_media_7d": "Baseline: media últimos 7 días",
     "baseline_semana_anterior": "Baseline: mismo día semana anterior",
 }
@@ -126,6 +146,8 @@ def _metrics(pred: pd.DataFrame, actual: pd.DataFrame) -> dict:
     out["mae_jurisdiccion"] = float(np.mean(np.abs(ej)))
     out["rmse_jurisdiccion"] = float(np.sqrt(np.mean(ej ** 2)))
     out["wape_jurisdiccion_pct"] = float(100 * np.abs(ej).sum() / max(aj.to_numpy().sum(), 1e-9))
+    a_flat = aj.to_numpy().ravel()
+    out["r2_jurisdiction"] = float(1 - (ej ** 2).sum() / max(((a_flat - a_flat.mean()) ** 2).sum(), 1e-9))
     pat = [c for c in pred.columns if c[1] == "PATRIMONIO"]
     out["mae_patrimonio"] = float(np.mean(np.abs((pred[pat] - actual[pat]).to_numpy())))
     return out
@@ -160,3 +182,9 @@ def backtest(kind: str, wide: pd.DataFrame, test_start: pd.Timestamp, test_end: 
     metrics["mae_semana_jurisdiccion"] = float(np.mean(np.abs(wk_p - wk_a)))
     metrics["wape_semana_jurisdiccion_pct"] = float(100 * np.abs(wk_p - wk_a).sum() / wk_a.sum())
     return metrics, by_h
+
+
+def backtest_windows(last: pd.Timestamp, days: int = config.BACKTEST_DAYS,
+                     folds: int = config.BACKTEST_FOLDS) -> list[tuple[pd.Timestamp, pd.Timestamp]]:
+    """Rolling evaluation windows of `days` days, oldest first; the newest one ends on `last`."""
+    return [(last - pd.Timedelta(days=days * (i + 1) - 1), last - pd.Timedelta(days=days * i)) for i in range(folds)][::-1]
