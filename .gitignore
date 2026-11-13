@@ -1,0 +1,36 @@
+# Secrets and local configuration
+.env
+.env.*
+!.env.example
+
+# Local PostgreSQL cluster created by scripts/db_start.ps1 (hundreds of MB, contains the restored data)
+pgdata/
+
+# Generated artefacts (rebuilt by the pipeline) and anything derived from real incident data
+data/
+models/
+*.joblib
+*.dump
+*.backup
+*.sql
+
+# Camera locations are sensitive infrastructure data: never commit them (see geo/README.md)
+camaras*.json
+geo/camaras_*.json
+geo/*vecinal*
+geo/*municipal*
+
+# Python
+__pycache__/
+*.pyc
+.venv/
+venv/
+.pytest_cache/
+.mypy_cache/
+
+# Tooling / OS
+.playwright-mcp/
+.vscode/
+.idea/
+.DS_Store
+Thumbs.db
