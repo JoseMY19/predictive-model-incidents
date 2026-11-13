@@ -7,6 +7,7 @@ from sklearn.ensemble import ExtraTreesRegressor, HistGradientBoostingRegressor,
 
 from . import config
 from .features import feature_columns, make_features, training_rows
+from .outliers import winsorize_target
 
 
 def make_model(kind: str):
@@ -33,11 +34,14 @@ MODEL_LABELS = {
 }
 
 
-def fit(kind: str, wide: pd.DataFrame, train_end: pd.Timestamp | None = None):
-    """Entrena con todas las filas completas hasta `train_end` (inclusive)."""
+def fit(kind: str, wide: pd.DataFrame, train_end: pd.Timestamp | None = None, winsorize_pct: float | None = None):
+    """Entrena con todas las filas completas hasta `train_end` (inclusive).
+    `winsorize_pct` (p. ej. 98): limita el objetivo de ENTRENAMIENTO al percentil por serie (ver app/outliers.py)."""
     df = training_rows(make_features(wide))
     if train_end is not None:
         df = df[df["fecha"] <= train_end]
+    if winsorize_pct is not None:
+        df = winsorize_target(df, winsorize_pct)
     cols = feature_columns(df)
     model = make_model("random_forest" if kind == ENSEMBLE else kind)
     model.fit(df[cols], df["y"])
@@ -128,14 +132,14 @@ def _metrics(pred: pd.DataFrame, actual: pd.DataFrame) -> dict:
 
 
 def backtest(kind: str, wide: pd.DataFrame, test_start: pd.Timestamp, test_end: pd.Timestamp,
-             horizon: int = config.BACKTEST_HORIZON) -> tuple[dict, dict]:
+             horizon: int = config.BACKTEST_HORIZON, winsorize_pct: float | None = None) -> tuple[dict, dict]:
     """Origen móvil: entrena con datos < test_start y pronostica `horizon` días recursivamente
     desde cada origen (cada `horizon` días) dentro de [test_start, test_end].
     Devuelve (metricas globales, mae jurisdicción-día por día de horizonte)."""
     is_baseline = kind.startswith("baseline")
     model = cols = None
     if not is_baseline:
-        model, cols, _ = fit(kind, wide, train_end=test_start - pd.Timedelta(days=1))
+        model, cols, _ = fit(kind, wide, train_end=test_start - pd.Timedelta(days=1), winsorize_pct=winsorize_pct)
     preds, actuals = [], []
     origin = test_start - pd.Timedelta(days=1)
     while origin + pd.Timedelta(days=horizon) <= test_end:
