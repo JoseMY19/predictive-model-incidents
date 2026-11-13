@@ -14,7 +14,7 @@ import pandas as pd
 
 from . import config
 from .features import build_wide, load_catalog
-from .modeling import MODEL_LABELS, backtest, fit
+from .modeling import MODEL_LABELS, backtest, backtest_windows, fit
 
 CANDIDATES = ["baseline_media_7d", "baseline_semana_anterior", "random_forest", "extra_trees", "hist_gradient_boosting", "ensemble_rf_es"]
 METRIC_KEYS = ["mae_serie", "rmse_serie", "mae_jurisdiccion", "rmse_jurisdiccion", "wape_jurisdiccion_pct",
@@ -27,8 +27,7 @@ def main() -> None:
     wide = build_wide(panel, catalog)
     last = pd.Timestamp(catalog["ultima_fecha"])
     # Ventanas móviles de BACKTEST_DAYS días, la última termina en el último día con datos.
-    windows = [(last - pd.Timedelta(days=config.BACKTEST_DAYS * (i + 1) - 1) , last - pd.Timedelta(days=config.BACKTEST_DAYS * i))
-               for i in range(config.BACKTEST_FOLDS)][::-1]
+    windows = backtest_windows(last)
     print(f"Datos válidos: {int(wide.notna().all(axis=1).sum())} días | ventanas de backtest: "
           + ", ".join(f"{a.date()}→{b.date()}" for a, b in windows))
 

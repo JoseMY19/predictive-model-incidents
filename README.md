@@ -68,7 +68,8 @@ exact weekly pattern still misses ≈ 30 % per jurisdiction-day. What is missing
 | Random Forest / HistGradientBoosting (Poisson) | 11.71 / 11.97 | |
 | **Ensemble RF + exponential smoothing** | **11.35** | −4.9 % vs. baseline; WAPE 35.2 % daily, 20.1 % weekly |
 
-Hyper-parameters were tuned on the same windows, so the gain is slightly optimistic.
+Hyper-parameters of the production models were tuned by hand on the same windows, so that gain is slightly optimistic; see the
+holdout-based search in *Analysis toolkit* below.
 
 **Spatial** (200 m cells, 21-day half-life, 16-week backtest): the top 5 % of cells capture ≈ 42 % of the next incidents
 (static ranking: 38 %), the top 10 % ≈ 57 %; the 20 pinned zones capture ≈ 21 % (chance ≈ 1.5 %).
@@ -76,6 +77,59 @@ Hyper-parameters were tuned on the same windows, so the gain is slightly optimis
 **Live replay** (model trained only on data before the cut-off, zones frozen, ≈ 1 500 real incidents afterwards):
 59–66 % fell in the top 10 % of cells (chance 10 %) and ≈ 20–24 % in the 20 pinned zones.
 `app/simulate.py` replays that scenario; `/api/live/status` keeps measuring it with real arrivals.
+
+## Analysis toolkit
+
+Four modules cover the usual data-science workflow. They read the aggregated panel only (no personal data) and write to the
+git-ignored `reports/` folder.
+
+| Command | What it does |
+|---|---|
+| `python -m app.eda` | Univariate / bivariate / multivariate analysis, six charts and data-generated insights (`reports/eda/EDA.md`) |
+| `python -m app.outliers` | IQR outlier report per series (jurisdiction × group) |
+| `python -m app.compare [--winsorize 98]` | Ridge, KNN, Random Forest, Extra Trees, Gradient Boosting, XGBoost, the ensemble and two baselines on the same rolling windows: MAE, RMSE, R², WAPE |
+| `python -m app.tune [--models ...] [--max-combos N]` | Time-aware hyper-parameter search; the newest window is a holdout the search never sees |
+
+Two rules differ from a classic tabular workflow: there is **no random train/test split** (it would train on days that come
+after the days it is scored on), and winsorization is applied to the **training target only**, with caps computed from training
+rows, while evaluation always uses raw counts.
+
+**Model comparison** (3 rolling windows of 56 days, 7-day horizon, jurisdiction-day level):
+
+| Model | MAE | RMSE | R² | vs. baseline |
+|---|---|---|---|---|
+| **Ensemble RF + exponential smoothing** | **11.35** | 15.02 | 0.413 | −4.9 % |
+| Ridge regression | 11.55 | 15.44 | 0.395 | −3.2 % |
+| XGBoost (Poisson) | 11.64 | 15.43 | 0.385 | −2.5 % |
+| Random Forest | 11.71 | 15.55 | 0.378 | −1.9 % |
+| Extra Trees | 11.83 | 15.72 | 0.369 | −0.9 % |
+| Baseline: 7-day mean | 11.94 | 15.66 | 0.358 | 0 % |
+| Gradient Boosting (Poisson) | 11.97 | 15.75 | 0.368 | +0.3 % |
+| K-Nearest Neighbors | 12.24 | 16.43 | 0.320 | +2.6 % |
+
+What this says:
+
+- The ensemble is still the best model, but the spread between sensible models is small (≈ 5 % of MAE). That matches the
+  practical ceiling measured in the audit: better models will not remove the unexplained day-to-day variance.
+- A plain **linear model (Ridge) beats Random Forest and Extra Trees**: the signal is mostly level + weekly pattern, which
+  the lag/rolling features already expose.
+- **Winsorizing the training target (P98) did not help** – it was neutral for the ensemble and worse for every other model
+  (e.g. Random Forest 11.71 → 11.87), because the extreme days are real demand, not errors. It stays off by default.
+- KNN is the weakest (distance in 40+ mixed features is not informative here).
+
+**Hyper-parameter search** (`app.tune`, 6 random combinations per model, tuned on the two older windows, scored on the newest
+window the search never saw):
+
+| Model | MAE defaults (holdout) | MAE best combination (holdout) |
+|---|---|---|
+| Random Forest | 10.203 | 10.203 |
+| XGBoost (Poisson) | 10.162 | 10.191 |
+| Ridge regression | 10.042 | 10.042 |
+| Gradient Boosting (Poisson) | 10.211 | 10.247 |
+
+The "best" combinations looked 0.2–0.5 % better on the tuning windows and were equal or slightly worse on the holdout: the
+current defaults are already at the optimum, and what looked like a gain was selection noise. **Tuning is not the lever** – the
+remaining error is variance the features cannot explain (see *What would raise accuracy*).
 
 ## API
 
@@ -105,6 +159,17 @@ from the Sivecam API, set `SIVECAM_API_URL/USER/PASSWORD` and run `python -m app
 `GET /municipal?page=0` from your browser and run `python -m app.camaras_remote --archivo response.json`.
 Neighbourhood cameras are detected and stored separately, keeping only position, brand and mode.
 
+## Contributing / Git workflow
+
+- **Branches:** `main` is always releasable; `develop` integrates finished work; every change lives in a short-lived branch cut
+  from `develop` and named `feature/<topic>`, `fix/<topic>`, `chore/<topic>` or `docs/<topic>`.
+- **Commits:** [Conventional Commits](https://www.conventionalcommits.org/) in English, small and focused
+  (`feat: ...`, `fix: ...`, `refactor: ...`, `test: ...`, `docs: ...`, `chore: ...`).
+- **Pull requests:** feature branch -> `develop` (with the PR template), then `develop` -> `main` for a release.
+  Nothing is pushed directly to `main`.
+- **Tests:** `pip install -r requirements-dev.txt && python -m pytest`. Tests use synthetic data only.
+- **Never commit** `.env`, real incident data, models, reports derived from real data, or camera locations (see `.gitignore`).
+
 ## Privacy and security
 
 - Secrets live only in `.env` (git-ignored). `.env.example` lists every variable.
@@ -123,7 +188,10 @@ app/
   spatial.py       200 m cells, hotspot scoring, cameras                   spatial_eval.py   spatial backtest/tuning
   live.py          background sync + live state          remote.py    production API sync
   camaras_remote.py  camera importer                     simulate.py  replay a past cut-off in "real time"
+  outliers.py      IQR report + winsorization             compare.py   model comparison report
+  tune.py          time-aware hyper-parameter search       eda.py       exploratory analysis + insights
   api.py           FastAPI service
+tests/             pytest suite on synthetic data (python -m pytest)
 geo/               jurisdiction polygons
 scripts/db_start.ps1
 ```

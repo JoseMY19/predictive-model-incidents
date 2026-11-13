@@ -6,3 +6,5 @@ python-dateutil>=2.9
 fastapi>=0.115
 uvicorn>=0.32
 psycopg2-binary>=2.9
+matplotlib>=3.8
+xgboost>=2.0          # optional: only needed for the XGBoost model in app.compare

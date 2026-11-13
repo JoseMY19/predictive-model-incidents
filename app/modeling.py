@@ -4,12 +4,17 @@ from __future__ import annotations
 import numpy as np
 import pandas as pd
 from sklearn.ensemble import ExtraTreesRegressor, HistGradientBoostingRegressor, RandomForestRegressor
+from sklearn.linear_model import Ridge
+from sklearn.neighbors import KNeighborsRegressor
+from sklearn.pipeline import make_pipeline
+from sklearn.preprocessing import RobustScaler
 
 from . import config
 from .features import feature_columns, make_features, training_rows
+from .outliers import winsorize_target
 
 
-def make_model(kind: str):
+def _base_model(kind: str):
     if kind == "random_forest":
         return RandomForestRegressor(n_estimators=300, min_samples_leaf=15, max_features=0.5,
                                      n_jobs=-1, random_state=config.RANDOM_STATE)
@@ -20,7 +25,29 @@ def make_model(kind: str):
         # Pérdida Poisson: apropiada para conteos (no negativos, muchos ceros).
         return HistGradientBoostingRegressor(loss="poisson", learning_rate=0.05, max_iter=300,
                                              min_samples_leaf=20, random_state=config.RANDOM_STATE)
+    if kind == "ridge":
+        # Linear baseline. RobustScaler (median/IQR) keeps heavy-tailed count features from dominating the fit.
+        return make_pipeline(RobustScaler(), Ridge(alpha=10.0))
+    if kind == "knn":
+        # Distance-based model: scaling is mandatory, otherwise lag_28 would outweigh the one-hot columns.
+        return make_pipeline(RobustScaler(), KNeighborsRegressor(n_neighbors=25, weights="distance", n_jobs=-1))
+    if kind == "xgboost":
+        try:
+            from xgboost import XGBRegressor
+        except ImportError as e:                                    # optional dependency
+            raise ImportError("xgboost is not installed: pip install xgboost") from e
+        return XGBRegressor(objective="count:poisson", n_estimators=400, learning_rate=0.05, max_depth=5, subsample=0.8,
+                            colsample_bytree=0.8, min_child_weight=10, n_jobs=-1, random_state=config.RANDOM_STATE)
     raise ValueError(kind)
+
+
+def make_model(kind: str, **params):
+    """Model with the project defaults; `params` override any hyper-parameter (sklearn `set_params` names, so
+    pipeline steps are addressed as `ridge__alpha`, `kneighborsregressor__n_neighbors`)."""
+    model = _base_model(kind)
+    if params:
+        model.set_params(**params)
+    return model
 
 
 MODEL_LABELS = {
@@ -28,18 +55,25 @@ MODEL_LABELS = {
     "extra_trees": "Extra Trees",
     "ensemble_rf_es": "Ensamble (Random Forest + suavizado exponencial)",
     "hist_gradient_boosting": "Gradient Boosting (Poisson)",
+    "ridge": "Ridge regression",
+    "knn": "K-Nearest Neighbors",
+    "xgboost": "XGBoost (Poisson)",
     "baseline_media_7d": "Baseline: media últimos 7 días",
     "baseline_semana_anterior": "Baseline: mismo día semana anterior",
 }
 
 
-def fit(kind: str, wide: pd.DataFrame, train_end: pd.Timestamp | None = None):
-    """Entrena con todas las filas completas hasta `train_end` (inclusive)."""
+def fit(kind: str, wide: pd.DataFrame, train_end: pd.Timestamp | None = None, winsorize_pct: float | None = None,
+        params: dict | None = None):
+    """Entrena con todas las filas completas hasta `train_end` (inclusive).
+    `winsorize_pct` (p. ej. 98): limita el objetivo de ENTRENAMIENTO al percentil por serie (ver app/outliers.py)."""
     df = training_rows(make_features(wide))
     if train_end is not None:
         df = df[df["fecha"] <= train_end]
+    if winsorize_pct is not None:
+        df = winsorize_target(df, winsorize_pct)
     cols = feature_columns(df)
-    model = make_model("random_forest" if kind == ENSEMBLE else kind)
+    model = make_model("random_forest" if kind == ENSEMBLE else kind, **(params or {}))
     model.fit(df[cols], df["y"])
     return model, cols, len(df)
 
@@ -122,20 +156,23 @@ def _metrics(pred: pd.DataFrame, actual: pd.DataFrame) -> dict:
     out["mae_jurisdiccion"] = float(np.mean(np.abs(ej)))
     out["rmse_jurisdiccion"] = float(np.sqrt(np.mean(ej ** 2)))
     out["wape_jurisdiccion_pct"] = float(100 * np.abs(ej).sum() / max(aj.to_numpy().sum(), 1e-9))
+    a_flat = aj.to_numpy().ravel()
+    out["r2_jurisdiction"] = float(1 - (ej ** 2).sum() / max(((a_flat - a_flat.mean()) ** 2).sum(), 1e-9))
     pat = [c for c in pred.columns if c[1] == "PATRIMONIO"]
     out["mae_patrimonio"] = float(np.mean(np.abs((pred[pat] - actual[pat]).to_numpy())))
     return out
 
 
 def backtest(kind: str, wide: pd.DataFrame, test_start: pd.Timestamp, test_end: pd.Timestamp,
-             horizon: int = config.BACKTEST_HORIZON) -> tuple[dict, dict]:
+             horizon: int = config.BACKTEST_HORIZON, winsorize_pct: float | None = None,
+             params: dict | None = None) -> tuple[dict, dict]:
     """Origen móvil: entrena con datos < test_start y pronostica `horizon` días recursivamente
     desde cada origen (cada `horizon` días) dentro de [test_start, test_end].
     Devuelve (metricas globales, mae jurisdicción-día por día de horizonte)."""
     is_baseline = kind.startswith("baseline")
     model = cols = None
     if not is_baseline:
-        model, cols, _ = fit(kind, wide, train_end=test_start - pd.Timedelta(days=1))
+        model, cols, _ = fit(kind, wide, train_end=test_start - pd.Timedelta(days=1), winsorize_pct=winsorize_pct, params=params)
     preds, actuals = [], []
     origin = test_start - pd.Timedelta(days=1)
     while origin + pd.Timedelta(days=horizon) <= test_end:
@@ -156,3 +193,9 @@ def backtest(kind: str, wide: pd.DataFrame, test_start: pd.Timestamp, test_end: 
     metrics["mae_semana_jurisdiccion"] = float(np.mean(np.abs(wk_p - wk_a)))
     metrics["wape_semana_jurisdiccion_pct"] = float(100 * np.abs(wk_p - wk_a).sum() / wk_a.sum())
     return metrics, by_h
+
+
+def backtest_windows(last: pd.Timestamp, days: int = config.BACKTEST_DAYS,
+                     folds: int = config.BACKTEST_FOLDS) -> list[tuple[pd.Timestamp, pd.Timestamp]]:
+    """Rolling evaluation windows of `days` days, oldest first; the newest one ends on `last`."""
+    return [(last - pd.Timedelta(days=days * (i + 1) - 1), last - pd.Timedelta(days=days * i)) for i in range(folds)][::-1]
