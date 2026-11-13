@@ -28,6 +28,25 @@ SYNC_SECONDS = 2.0
 REMOTE_SECONDS = 10.0          # cada cuánto se consulta la API de producción
 
 
+RELOAD_MIN_AGE_S = 2.0        # a file touched less than this long ago may still be mid-write: wait for the next cycle
+
+
+def artifact_stamp(path) -> tuple[int, int] | None:
+    """(mtime_ns, size) of a file, or None if it does not exist. Used to detect that the retraining job swapped the model."""
+    try:
+        st = path.stat()
+    except FileNotFoundError:
+        return None
+    return st.st_mtime_ns, st.st_size
+
+
+def is_stable(path, min_age_s: float = RELOAD_MIN_AGE_S, now: float | None = None) -> bool:
+    try:
+        return (now if now is not None else time.time()) - path.stat().st_mtime >= min_age_s
+    except FileNotFoundError:
+        return False
+
+
 class Live:
     def __init__(self) -> None:
         self.snap: dict = {}
@@ -42,10 +61,40 @@ class Live:
         self.remote = RemoteSync()
         self._remote_t = 0.0
         self._stop = threading.Event()
-        self._art = joblib.load(config.MODEL_FILE)
-        self._base_catalog = json.loads(config.CATALOG_JSON.read_text(encoding="utf-8"))
-        self._spatial = json.loads(config.SPATIAL_JSON.read_text(encoding="utf-8"))
-        self.params = self._spatial["parametros"]
+        self.reload_error: str | None = None
+        self.model_loaded_at: pd.Timestamp | None = None
+        self._force_forecast = False
+        self._load_artifacts()
+
+    # ------------------------------------------------------------------ model artifacts (hot reload)
+    def _load_artifacts(self) -> None:
+        """Load model, metrics, spatial parameters and catalog. Everything is read first and assigned together, so a
+        failure halfway leaves the previous (consistent) set in place."""
+        art = joblib.load(config.MODEL_FILE)
+        catalog = json.loads(config.CATALOG_JSON.read_text(encoding="utf-8"))
+        spatial = json.loads(config.SPATIAL_JSON.read_text(encoding="utf-8"))
+        metrics = json.loads(config.METRICS_JSON.read_text(encoding="utf-8"))
+        self._art, self._base_catalog, self.spatial, self.metrics = art, catalog, spatial, metrics
+        self.params = spatial["parametros"]
+        self._stamp = artifact_stamp(config.METRICS_JSON)
+        self.model_loaded_at = pd.Timestamp.now(tz=config.TZ)
+
+    def check_reload(self) -> bool:
+        """If the retraining job replaced the model (metrics.json is swapped last), load the new set and force a rebuild of
+        the snapshot and the forecast. Returns True when a reload happened."""
+        stamp = artifact_stamp(config.METRICS_JSON)
+        if stamp is None or stamp == self._stamp or not is_stable(config.METRICS_JSON):
+            return False
+        try:
+            self._load_artifacts()
+        except Exception as e:                       # keep serving the old model; do not retry until the files change again
+            self._stamp = stamp
+            self.reload_error = f"{type(e).__name__}: {e}"[:200]
+            return False
+        self.reload_error = None
+        self._sig = None
+        self._force_forecast = True
+        return True
 
     # ------------------------------------------------------------------ construcción del estado
     def _rebuild(self, conn, asof: pd.Timestamp) -> None:
@@ -66,9 +115,10 @@ class Live:
         sm = SpatialModel.build(geo[geo["fecha"] <= last_full], cat["grupos"], last_full)
 
         prev = self.snap
-        if prev and prev["origin"] == last_full:
-            fc = prev["forecast"]                         # mismo día: el pronóstico no cambia
+        if prev and prev["origin"] == last_full and not self._force_forecast:
+            fc = prev["forecast"]                         # mismo día: el pronóstico no cambia (salvo modelo nuevo)
         else:
+            self._force_forecast = False
             fc = predict(self._art["kind"], self._art["model"], self._art["cols"], wide, last_full, config.HORIZON_MAX)
         snap = {"catalog": cat, "wide": wide, "forecast": fc, "origin": last_full, "sm": sm, "as_of": asof,
                 "total": int(panel["n"].sum())}
@@ -106,6 +156,7 @@ class Live:
 
     # ------------------------------------------------------------------ ciclo
     def step(self, conn) -> None:
+        self.check_reload()
         if self.remote.enabled and time.monotonic() - self._remote_t >= REMOTE_SECONDS:
             self._remote_t = time.monotonic()
             self.remote.sync()                              # trae lo nuevo de la API a la base local (errores quedan en status)
@@ -160,7 +211,10 @@ class Live:
         out = {"modo": "simulado" if self._sim else "real", "version": self.version, "ahora": self.snap["as_of"].strftime("%Y-%m-%d %H:%M"),
                "ultimo_dia_completo": self.snap["origin"].strftime("%Y-%m-%d"), "total_incidencias_modelo": self.snap["total"],
                "ultima_sincronizacion": self.last_sync.strftime("%H:%M:%S") if self.last_sync is not None else None,
-               "error": self.last_error, "llegadas": int(len(a)), "api": self.remote.status()}
+               "error": self.last_error, "llegadas": int(len(a)), "api": self.remote.status(),
+               "modelo": {"entrenado": self.metrics.get("entrenado"), "datos_hasta": self.metrics.get("ultima_fecha_datos"),
+                          "cargado": self.model_loaded_at.strftime("%Y-%m-%d %H:%M:%S") if self.model_loaded_at is not None else None,
+                          "error_recarga": self.reload_error}}
         if self.frozen:
             w = a[a["en_ventana"] & a["lat"].notna()] if len(a) else a
             n = int(len(w))

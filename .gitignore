@@ -10,6 +10,7 @@ pgdata/
 data/
 models/
 reports/
+logs/
 *.joblib
 *.dump
 *.backup
