@@ -45,9 +45,7 @@ async def lifespan(_: FastAPI):
     for f in gj["features"]:
         j = jur_by_norm.get(_norm(f["properties"]["name"]))
         f["properties"] = {"nombre": f["properties"]["name"], "jurisdiccion_id": j["id"] if j else None}
-    state.update(live=live, spatial=json.loads(config.SPATIAL_JSON.read_text(encoding="utf-8")), cameras=load_cameras(),
-                 poligonos=gj, jur_name={j["id"]: j["nombre"] for j in catalog["jurisdicciones"]},
-                 metrics=json.loads(config.METRICS_JSON.read_text(encoding="utf-8")))
+    state.update(live=live, cameras=load_cameras(), poligonos=gj, jur_name={j["id"]: j["nombre"] for j in catalog["jurisdicciones"]})
     yield
     live.stop()
     state.clear()
@@ -69,7 +67,7 @@ def health():
 
 @app.get("/api/meta")
 def meta():
-    m = state["metrics"]
+    m = state["live"].metrics
     bt = m["backtest"]
     res = bt["resultados"]
     s = snap()
@@ -88,7 +86,7 @@ def meta():
                 for k, v in res.items()],
             "importancias": m["importancias"],
         },
-        "espacial": {k: state["spatial"][k] for k in SPATIAL_META_KEYS},
+        "espacial": {k: state["live"].spatial[k] for k in SPATIAL_META_KEYS},
     }
 
 
@@ -142,7 +140,7 @@ def hotspots(dias: int = Query(7, ge=1, le=config.HORIZON_MAX), grupo: str = "TO
     origin: pd.Timestamp = s["origin"]
     fc: pd.DataFrame = s["forecast"].iloc[:dias]
     lam = {c: float(fc[c].sum()) for c in fc.columns}
-    L = sm.expected(origin, lam, state["spatial"]["parametros"])           # (celdas, grupos)
+    L = sm.expected(origin, lam, state["live"].spatial["parametros"])           # (celdas, grupos)
     score_all = L.sum(axis=1) if grupo == "TODOS" else L[:, sm.grupos.index(grupo)]
     # Nivel de riesgo relativo al resto de las celdas (para el mismo filtro de tipo).
     # Si se filtra por jurisdicción, el nivel es relativo a las celdas de ESA jurisdicción (no a todo SJL).
@@ -185,7 +183,7 @@ def hotspots(dias: int = Query(7, ge=1, le=config.HORIZON_MAX), grupo: str = "TO
             "camara": cam, "titulo": "Posible incidencia",
             "mensaje": f"Tipo más probable: {principal}. {accion}",
         })
-    sp = state["spatial"]
+    sp = state["live"].spatial
     return {
         "origen": origin.strftime("%Y-%m-%d"),
         "desde": (origin + pd.Timedelta(days=1)).strftime("%Y-%m-%d"),
