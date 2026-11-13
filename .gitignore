@@ -9,6 +9,7 @@ pgdata/
 # Generated artefacts (rebuilt by the pipeline) and anything derived from real incident data
 data/
 models/
+reports/
 *.joblib
 *.dump
 *.backup
