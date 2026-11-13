@@ -14,7 +14,7 @@ from .features import feature_columns, make_features, training_rows
 from .outliers import winsorize_target
 
 
-def make_model(kind: str):
+def _base_model(kind: str):
     if kind == "random_forest":
         return RandomForestRegressor(n_estimators=300, min_samples_leaf=15, max_features=0.5,
                                      n_jobs=-1, random_state=config.RANDOM_STATE)
@@ -41,6 +41,15 @@ def make_model(kind: str):
     raise ValueError(kind)
 
 
+def make_model(kind: str, **params):
+    """Model with the project defaults; `params` override any hyper-parameter (sklearn `set_params` names, so
+    pipeline steps are addressed as `ridge__alpha`, `kneighborsregressor__n_neighbors`)."""
+    model = _base_model(kind)
+    if params:
+        model.set_params(**params)
+    return model
+
+
 MODEL_LABELS = {
     "random_forest": "Random Forest",
     "extra_trees": "Extra Trees",
@@ -54,7 +63,8 @@ MODEL_LABELS = {
 }
 
 
-def fit(kind: str, wide: pd.DataFrame, train_end: pd.Timestamp | None = None, winsorize_pct: float | None = None):
+def fit(kind: str, wide: pd.DataFrame, train_end: pd.Timestamp | None = None, winsorize_pct: float | None = None,
+        params: dict | None = None):
     """Entrena con todas las filas completas hasta `train_end` (inclusive).
     `winsorize_pct` (p. ej. 98): limita el objetivo de ENTRENAMIENTO al percentil por serie (ver app/outliers.py)."""
     df = training_rows(make_features(wide))
@@ -63,7 +73,7 @@ def fit(kind: str, wide: pd.DataFrame, train_end: pd.Timestamp | None = None, wi
     if winsorize_pct is not None:
         df = winsorize_target(df, winsorize_pct)
     cols = feature_columns(df)
-    model = make_model("random_forest" if kind == ENSEMBLE else kind)
+    model = make_model("random_forest" if kind == ENSEMBLE else kind, **(params or {}))
     model.fit(df[cols], df["y"])
     return model, cols, len(df)
 
@@ -154,14 +164,15 @@ def _metrics(pred: pd.DataFrame, actual: pd.DataFrame) -> dict:
 
 
 def backtest(kind: str, wide: pd.DataFrame, test_start: pd.Timestamp, test_end: pd.Timestamp,
-             horizon: int = config.BACKTEST_HORIZON, winsorize_pct: float | None = None) -> tuple[dict, dict]:
+             horizon: int = config.BACKTEST_HORIZON, winsorize_pct: float | None = None,
+             params: dict | None = None) -> tuple[dict, dict]:
     """Origen móvil: entrena con datos < test_start y pronostica `horizon` días recursivamente
     desde cada origen (cada `horizon` días) dentro de [test_start, test_end].
     Devuelve (metricas globales, mae jurisdicción-día por día de horizonte)."""
     is_baseline = kind.startswith("baseline")
     model = cols = None
     if not is_baseline:
-        model, cols, _ = fit(kind, wide, train_end=test_start - pd.Timedelta(days=1), winsorize_pct=winsorize_pct)
+        model, cols, _ = fit(kind, wide, train_end=test_start - pd.Timedelta(days=1), winsorize_pct=winsorize_pct, params=params)
     preds, actuals = [], []
     origin = test_start - pd.Timedelta(days=1)
     while origin + pd.Timedelta(days=horizon) <= test_end:
